@@ -1357,7 +1357,8 @@ from .vk import (
 from .vlive import (
     VLiveIE,
     VLiveChannelIE,
-    VLivePlaylistIE
+    VLivePlaylistIE,
+    VLivePostIE,
 )
 from .vodlocker import VodlockerIE
 from .vodpl import VODPlIE

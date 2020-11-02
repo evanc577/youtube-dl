@@ -99,32 +99,43 @@ class VLiveIE(NaverBaseIE):
         video_id = self._match_id(url)
 
         webpage = self._download_webpage(
-            'https://www.vlive.tv/video/%s' % video_id, video_id)
+            f'https://www.vlive.tv/video/{video_id}', video_id)
 
-        VIDEO_PARAMS_RE = r'\bvlive\.video\.init\(([^)]+)'
-        VIDEO_PARAMS_FIELD = 'video params'
+        PRELOAD_STATE_RE = r'>window\.__PRELOADED_STATE__=({.+})</script>'
+        PRELOAD_STATE_FIELD = 'preload state'
 
-        params = self._parse_json(self._search_regex(
-            VIDEO_PARAMS_RE, webpage, VIDEO_PARAMS_FIELD, default=''), video_id,
-            transform_source=lambda s: '[' + s + ']', fatal=False)
+        preload_state = self._parse_json(
+                self._search_regex(
+                    PRELOAD_STATE_RE, webpage, PRELOAD_STATE_FIELD),
+                video_id)
 
-        if not params or len(params) < 7:
-            params = self._search_regex(
-                VIDEO_PARAMS_RE, webpage, VIDEO_PARAMS_FIELD)
-            params = [p.strip(r'"') for p in re.split(r'\s*,\s*', params)]
+        upcoming = preload_state['postDetail']['post']['officialVideo']['upcomingYn']
+        vid_type = preload_state['postDetail']['post']['officialVideo']['type']
 
-        status, long_video_id, key = params[2], params[5], params[6]
-        status = remove_start(status, 'PRODUCT_')
+        if vid_type == 'LIVE':
+            if upcoming:
+                status = 'UPCOMING'
+            else:
+                status = vid_type
+        else:
+            status = vid_type
+            key_webpage = self._download_webpage(
+                    f'https://www.vlive.tv/globalv-web/vam-web/video/v1.0/vod/{video_id}/inkey',
+                    video_id,
+                    headers={'Referer': f'https://www.vlive.tv/video/{video_id}'},
+                    note='Getting key'
+                    )
+            key = self._parse_json(key_webpage, video_id)['inkey']
 
-        if status in ('LIVE_ON_AIR', 'BIG_EVENT_ON_AIR'):
-            return self._live(video_id, webpage)
-        elif status in ('VOD_ON_AIR', 'BIG_EVENT_INTRO'):
-            return self._replay(video_id, webpage, long_video_id, key)
+        if status in ('LIVE_ON_AIR', 'BIG_EVENT_ON_AIR', 'LIVE'):
+            return self._live(video_id, preload_state)
+        elif status in ('VOD_ON_AIR', 'BIG_EVENT_INTRO', 'VOD'):
+            return self._replay(video_id, preload_state, key)
 
         if status == 'LIVE_END':
             raise ExtractorError('Uploading for replay. Please wait...',
                                  expected=True)
-        elif status == 'COMING_SOON':
+        elif status in ('COMING_SOON', 'UPCOMING'):
             raise ExtractorError('Coming soon!', expected=True)
         elif status == 'CANCELED':
             raise ExtractorError('We are sorry, '
@@ -135,59 +146,42 @@ class VLiveIE(NaverBaseIE):
         else:
             raise ExtractorError('Unknown status %s' % status)
 
-    def _get_common_fields(self, webpage):
-        title = self._og_search_title(webpage)
-        creator = self._html_search_regex(
-            r'<div[^>]+class="info_area"[^>]*>\s*(?:<em[^>]*>.*?</em\s*>\s*)?<a\s+[^>]*>([^<]+)',
-            webpage, 'creator', fatal=False)
-        thumbnail = self._og_search_thumbnail(webpage)
+    def _get_common_fields(self, preload_state):
         return {
-            'title': title,
-            'creator': creator,
-            'thumbnail': thumbnail,
+            'title': "[V LIVE] " + preload_state['postDetail']['post']['title'],
+            'creator': preload_state['channel']['channel']['channelName'],
+            'thumbnail': preload_state['postDetail']['post']['officialVideo']['thumb'],
         }
 
-    def _live(self, video_id, webpage):
-        init_page = self._download_init_page(video_id)
+    def _replay(self, video_id, preload_state, key):
+        long_video_id = preload_state['postDetail']['post']['officialVideo']['vodId']
+        return merge_dicts(
+                self._get_common_fields(preload_state),
+                self._extract_video_info(video_id, long_video_id, key))
 
-        live_params = self._search_regex(
-            r'"liveStreamInfo"\s*:\s*(".*"),',
-            init_page, 'live stream info')
-        live_params = self._parse_json(live_params, video_id)
-        live_params = self._parse_json(live_params, video_id)
+    def _live(self, video_id, preload_state):
+        live_webpage = self._download_webpage(
+                f'https://www.vlive.tv/globalv-web/vam-web/old/v3/live/{video_id}/playInfo',
+                video_id,
+                headers={'Referer': f'https://www.vlive.tv/video/{video_id}'}
+        )
+        live_json = self._parse_json(live_webpage, video_id)
 
         formats = []
-        for vid in live_params.get('resolutions', []):
+        for vid in live_json['result'].get('streamList', []):
             formats.extend(self._extract_m3u8_formats(
-                vid['cdnUrl'], video_id, 'mp4',
-                m3u8_id=vid.get('name'),
+                vid['serviceUrl'], video_id, 'mp4',
+                m3u8_id=vid.get('streamName'),
                 fatal=False, live=True))
         self._sort_formats(formats)
 
-        info = self._get_common_fields(webpage)
+        info = self._get_common_fields(preload_state)
         info.update({
-            'title': self._live_title(info['title']),
             'id': video_id,
             'formats': formats,
             'is_live': True,
         })
         return info
-
-    def _replay(self, video_id, webpage, long_video_id, key):
-        if '' in (long_video_id, key):
-            init_page = self._download_init_page(video_id)
-            video_info = self._parse_json(self._search_regex(
-                (r'(?s)oVideoStatus\s*=\s*({.+?})\s*</script',
-                 r'(?s)oVideoStatus\s*=\s*({.+})'), init_page, 'video info'),
-                video_id)
-            if video_info.get('status') == 'NEED_CHANNEL_PLUS':
-                self.raise_login_required(
-                    'This video is only available for CH+ subscribers')
-            long_video_id, key = video_info['vid'], video_info['inkey']
-
-        return merge_dicts(
-            self._get_common_fields(webpage),
-            self._extract_video_info(video_id, long_video_id, key))
 
     def _download_init_page(self, video_id):
         return self._download_webpage(
@@ -365,3 +359,38 @@ class VLivePlaylistIE(InfoExtractor):
             webpage, 'playlist title', fatal=False)
 
         return self.playlist_result(entries, playlist_id, playlist_name)
+
+class VLivePostIE(InfoExtractor):
+    IE_NAME = 'vlive:post'
+    _VALID_URL = r'https?://(?:(?:www|m)\.)?vlive\.tv/post/(?P<id>[\d-]+)'
+    _VIDEO_URL_TEMPLATE = 'http://www.vlive.tv/video/%s'
+
+    _TESTS = [{
+        'url': 'https://www.vlive.tv/post/1-19664999',
+        'info_dict': {
+            'id': '1-19664999',
+            'ext': 'mp4',
+            'title': "[V LIVE] REPLAY[Dreamcatcher] Bark Bark!! Growl!!!",
+            'creator': "DREAMCATGCHER",
+            'view_count': int,
+            'uploader_id': 'muploader_a',
+        }
+    }]
+
+    def _real_extract(self, url):
+        video_id = self._match_id(url)
+        webpage = self._download_webpage(url, video_id)
+
+        PRELOAD_STATE_RE = r'>window\.__PRELOADED_STATE__=({.+})</script>'
+        PRELOAD_STATE_FIELD = 'preload state'
+
+        preload_state = self._parse_json(
+                self._search_regex(
+                    PRELOAD_STATE_RE, webpage, PRELOAD_STATE_FIELD),
+                video_id)
+
+        vid_id = preload_state['postDetail']['post']['officialVideo']['videoSeq']
+
+        return self.url_result(
+            self._VIDEO_URL_TEMPLATE % vid_id,
+            ie=VLiveIE.ie_key(), video_id=vid_id)

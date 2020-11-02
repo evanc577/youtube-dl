@@ -1043,6 +1043,7 @@
  - **vlive**
  - **vlive:channel**
  - **vlive:playlist**
+ - **vlive:post**
  - **Vodlocker**
  - **VODPl**
  - **VODPlatform**
